@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# 打包产物（体积大，不入库）
+build/
+dist/
+*.exe
+*.msi
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 日志与运行时数据
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
