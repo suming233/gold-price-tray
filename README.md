@@ -4,6 +4,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#)
 [![Python](https://img.shields.io/badge/python-3.8%2B-green)](#)
 [![Downloads](https://img.shields.io/github/downloads/suming233/gold-price-tray/total?label=downloads)](releases)
+[![Build](https://github.com/suming233/gold-price-tray/actions/workflows/build.yml/badge.svg)](https://github.com/suming233/gold-price-tray/actions/workflows/build.yml)
 
 **Windows 任务栏实时金价小工具**——托盘图标直接显示金价数字，鼠标悬停弹出大字体详情卡，双击查看走势图。
 
@@ -66,6 +67,10 @@ build.bat
 ```
 
 产物在 `dist/GoldPriceTray.exe`。
+
+不想本地打包也没关系：本仓库配了 GitHub Actions，**推送 `v*` 标签会自动在
+windows-latest 上打包，并把 `GoldPriceTray_Setup.exe` 挂到对应的 Release**；
+也可以在 Actions 页面手动点 Run workflow 只构建不发布。
 
 ## 数据源
 
