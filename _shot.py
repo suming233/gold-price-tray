@@ -6,7 +6,10 @@ import time
 import ctypes
 from ctypes import wintypes, byref
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+BASE = os.path.dirname(os.path.abspath(__file__))
+DOCS = os.path.join(BASE, "docs")
+os.makedirs(DOCS, exist_ok=True)
+sys.path.insert(0, BASE)
 
 import tkinter as tk
 from PIL import Image
@@ -84,7 +87,7 @@ def shoot_chart(mode="day", out="docs_chart.png"):
     import chart
     import gold_price_tray as g
 
-    code = "hf_XAU"
+    code = g.DEFAULT_SOURCE
     cw = chart.ChartWindow(lambda: g.fetch_quote(code))
     cw.root.title("CHART_CAPTURE")
     cw.root.deiconify()
@@ -126,7 +129,7 @@ def shoot_chart(mode="day", out="docs_chart.png"):
 def shoot_card():
     import gold_price_tray as g
 
-    code = "hf_XAU"
+    code = g.DEFAULT_SOURCE
     card = g.HoverCard(lambda: g.fetch_quote(code))
     q = g.fetch_quote(code)
     if not q:
@@ -152,8 +155,9 @@ def shoot_card():
     if not hwnd:
         root.destroy()
         return
-    ok, size = capture(hwnd, os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs_card.png"))
-    print("card captured:", ok, size)
+    out_path = os.path.join(DOCS, "screenshot_hover.png")
+    ok, size = capture(hwnd, out_path)
+    print("card captured:", ok, size, "->", out_path)
     root.destroy()
 
 
@@ -162,7 +166,10 @@ if __name__ == "__main__":
     if which == "chart":
         # 用法: _shot.py chart [day|week|month] [输出文件名]
         mode = sys.argv[2] if len(sys.argv) > 2 else "day"
-        out = sys.argv[3] if len(sys.argv) > 3 else "docs_chart.png"
+        out = sys.argv[3] if len(sys.argv) > 3 else "docs/screenshot_chart.png"
         shoot_chart(mode, out)
     else:
         shoot_card()
+    # Tk 退出时偶发残留线程导致进程不结束，截图已落盘，直接强制退出
+    sys.stdout.flush()
+    os._exit(0)

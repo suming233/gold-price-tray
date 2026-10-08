@@ -15,6 +15,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM build\ 是 PyInstaller 的中间缓存（约 22MB），__pycache__\ 是字节码缓存，
+REM 两者都能自动重建，没必要留在工程里占地方 —— 打完包顺手清掉。
+if exist build rmdir /S /Q build
+if exist __pycache__ rmdir /S /Q __pycache__
+
 echo.
 echo [完成] 产物已生成：dist\GoldPriceTray.exe
+echo [已清理] build\ 与 __pycache__\ 中间产物
 pause

@@ -104,6 +104,43 @@ def fetch_minute_kline(symbol=KLINE_SYMBOL, mtype=5):
         return []
 
 
+def fetch_spot_quote():
+    """新浪伦敦金 hf_XAU 实时报价（已换算人民币元/克），走势图自用。
+
+    走势图的数据序列取自伦敦金 K 线，因此基准价也必须同源。主界面若切到
+    「浙商积存金」或「沪金99」，其昨收与这条序列不是同一个市场，直接拿来画
+    虚线会明显错位（浙商昨收 907 对伦敦金序列 889 就是典型）。失败返回 None，
+    此时图上不画昨收线，而不是画一条错的。
+    """
+    url = "https://hq.sinajs.cn/list=hf_XAU"
+    req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read().decode("gbk", errors="ignore")
+        m = re.search(r'"([^"]*)"', raw)
+        if not m or not m.group(1).strip():
+            return None
+        f = m.group(1).split(",")
+        if len(f) < 14:
+            return None
+        rate = _get_cny_rate()
+        if not rate:
+            return None
+        k = rate / OZ_TO_GRAM
+        return {"code": "hf_XAU", "name": "伦敦金",
+                "price": float(f[0]) * k, "prev": float(f[7]) * k,
+                "unit": "元/克", "date": f[12], "time": f[6]}
+    except Exception:
+        return None
+
+
+def fetch_kline_quote(main_quote):
+    """让基准价与 k 线序列同源：主品种不是国际盘时，改用伦敦金自己的报价。"""
+    if main_quote and str(main_quote.get("code", "")).startswith("hf_"):
+        return main_quote
+    return fetch_spot_quote() or main_quote
+
+
 class ChartWindow:
     W, H = 760, 460
     PAD_L, PAD_R, PAD_T, PAD_B = 62, 20, 46, 36
@@ -192,7 +229,7 @@ class ChartWindow:
             self.q.put(("error", str(e)))
 
     def _fetch_day(self):
-        q = self.get_quote()
+        q = fetch_kline_quote(self.get_quote())
         rows = fetch_minute_kline(KLINE_SYMBOL, 5)
         today = time.strftime("%Y-%m-%d")
         # 国际金价 24h 连续交易（北京时间 06:00 起），保留当日全部数据
@@ -226,7 +263,7 @@ class ChartWindow:
             return
         dates = [d for d, _ in rows]
         closes = [c for _, c in rows]
-        q = self.get_quote()
+        q = fetch_kline_quote(self.get_quote())
         name = q.get("name") if q else "沪金99"
         cur = closes[-1]
         prev = closes[-2] if len(closes) > 1 else cur
