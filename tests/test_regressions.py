@@ -33,7 +33,7 @@ class RegressionTests(unittest.TestCase):
     def test_actual_pystray_actions_select_all_sources_and_keep_menu_usable(self):
         tray = g.GoldTray()
         menu = tray.menu()
-        submenu = next(i.submenu for i in menu if i.text == '显示品种')
+        submenu = next(i.submenu for i in menu if i.text.startswith('显示品种'))
         for code, item in zip(g.SOURCES, submenu):
             item(Mock())  # Real pystray dispatch with its (icon, item) contract.
             self.assertEqual(tray.source, code)

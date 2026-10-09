@@ -20,7 +20,7 @@
 
 - **托盘图标显示实时金价**，默认显示**浙商银行积存金**（元/克）
 - **悬停详情卡**：整体按 1.5 倍放大，价格数字 69px 加粗并单独染涨跌色，单位与其余信息用小字
-- **走势图**：单击或双击图标打开伦敦金参考行情，可切换当日分时 / 近一周 / 近一月；重复打开复用窗口
+- **走势图**：单击或双击图标优先打开浙商银行积存金真实行情，可切换当日分时 / 近一周 / 近一月；伦敦金作为手动切换的参考行情，重复打开复用窗口并回到浙商
 - **品种切换**：浙商银行积存金（默认）、伦敦金 XAU/USD、纽约黄金、沪金 99、黄金 T+D，重启后保留选择
 - **涨红跌绿**，符合国内行情习惯
 - 每 30 秒自动刷新，支持开机自启
@@ -102,6 +102,8 @@ windows-latest 上打包，并把 `GoldPriceTray_Setup.exe` 挂到对应的 Rele
 | 用途 | 接口 |
 | --- | --- |
 | 浙商银行积存金（默认） | `api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816` |
+| 浙商当日分时 | 京东官方 `cfGetPriceTrendChart`，`productSku=1961543816`、`priceType=buy` |
+| 浙商近周/月历史 | 京东官方 `cfGetQuotesPriceKLine`，`productSku=1961543816`、`periodType=m1` |
 | 伦敦金（美元/盎司，24h 连续） | `hq.sinajs.cn/list=hf_XAU` |
 | 沪金 99 / 黄金 T+D / 纽约黄金 | `hq.sinajs.cn/list=gds_AU9999` 等 |
 | 美元/人民币汇率 | `hq.sinajs.cn/list=fx_susdcny` |
@@ -116,9 +118,9 @@ windows-latest 上打包，并把 `GoldPriceTray_Setup.exe` 挂到对应的 Rele
 
 （1 金衡盎司 = 31.1035 克）
 
-> 浙商银行积存金的公开接口只提供当前价与昨收，**不提供开高低与 K 线**，
-> 因此悬停卡在该品种下不显示最高/最低/今开。走势图的曲线取自伦敦金，
-> 其"昨收"基准线也同步改用伦敦金自身的昨收，避免与曲线错位。
+> 浙商实时报价接口未提供开高低，悬停卡不展示这些字段。v3.12.0 新接入京东官方浙商图表接口，
+> 默认曲线为浙商自身的人民币买入报价；分时使用浙商昨收，周/月涨跌相对区间首日。
+> 近一周取最近 5 个有报价的日期，近一月使用官方返回的一个月历史。接口失败时明确提示，不替换为其他市场曲线。
 
 ## 免责声明
 
@@ -131,7 +133,7 @@ price right on your taskbar — by default the **China Zheshang Bank gold
 accumulation plan** quote (CNY per gram).
 
 - Tray icon shows the live price; hover for a detailed pop-up card
-- Click the icon for London gold reference charts; intraday / 1-week / 1-month views
+- Click the icon for Zheshang gold charts first; intraday / 1-week / 1-month views, with optional London reference charts
 - Remembers the selected symbol; marks cached quotes when updates fail
 - Multiple symbols: Zheshang accumulation gold, London gold, COMEX gold,
   SHFE gold, Gold T+D

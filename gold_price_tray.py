@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-GoldPriceTray —— Windows 任务栏托盘实时金价小工具 (v3.11.1 自安装版)
+GoldPriceTray —— Windows 任务栏托盘实时金价小工具 (v3.12.0 自安装版)
 ==================================================================
 - 托盘图标直接显示实时金价数字（默认**浙商银行积存金**，元/克）
 - 国际金价（美元/盎司）自动按实时汇率换算为人民币计价（元/克）显示
@@ -13,7 +13,7 @@ GoldPriceTray —— Windows 任务栏托盘实时金价小工具 (v3.11.1 自�
 - 每 30 秒自动刷新
 - 日志有界：只在首次取价 / 涨跌转向 / 出错与恢复 / 每小时心跳时落盘，
   且文件超过 256 KB 自动轮转 —— 长期运行不会把磁盘写满
-- 双击/单击托盘图标 → 弹出金价走势折线图（当日分时 / 近一周 / 近一月可切换）
+- 双击/单击托盘图标 → 优先展示浙商黄金走势（分时 / 周 / 月），可手动查看伦敦金参考
 - 右键菜单：查看走势、切换品种、立即刷新、开机自启开关、卸载、退出
 
 【单文件自安装】打包为 --onefile --windowed exe 后：
@@ -313,7 +313,7 @@ ZHESHANG_URL = ("https://api.jdjygold.com/gw2/generic/jrm/h5/m/"
 _ref_cache = {"quote": None, "ts": 0.0}
 
 
-def fetch_zheshang_quote():
+def fetch_zheshang_quote(include_reference=True):
     """浙商银行积存金实时价（元/克）。
 
     涨跌以接口给的 yesterdayPrice 为基准（银行牌的"昨收"，非交易所昨结）。
@@ -361,7 +361,8 @@ def fetch_zheshang_quote():
             "cny": True, "rate": None, "usd_price": None,
             "unit": "元/克", "has_ohlc": False,
         }
-        q.update(_get_spot_reference())
+        if include_reference:
+            q.update(_get_spot_reference())
         return q
     except Exception as e:
         return {"error": str(e)}
@@ -607,6 +608,8 @@ class HoverCard:
                 if command == "chart":
                     import chart
                     if self.chart_window and self.chart_window.root.winfo_exists():
+                        if self.chart_window.market != chart.ZHESHANG_CODE:
+                            self.chart_window.switch_market(chart.ZHESHANG_CODE)
                         self.chart_window.root.deiconify()
                         self.chart_window.root.lift()
                         self.chart_window.root.focus_force()
@@ -952,7 +955,7 @@ def set_autostart(enable: bool) -> bool:
 # ---------------- 自安装 / 卸载（单文件移植版） ----------------
 APP_NAME    = "GoldPriceTray"
 APP_TITLE   = "金价托盘 GoldPriceTray"
-APP_VERSION = "3.11.1"
+APP_VERSION = "3.12.0"
 
 RUN_KEY_PATH       = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\GoldPriceTray"
@@ -1354,13 +1357,13 @@ class GoldTray:
         return pystray.Menu(
             pystray.MenuItem("金价小工具 (每30秒刷新)", None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("查看金价走势…", self.open_chart, default=True),
+            pystray.MenuItem("查看浙商黄金走势…", self.open_chart, default=True),
             pystray.MenuItem(
                 lambda item: f"{SOURCES[self.source]}  {self._price_str()}",
                 self.refresh_now),
             pystray.MenuItem("立即刷新", self.refresh_now),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("显示品种", pystray.Menu(
+            pystray.MenuItem("显示品种（浙商优先）", pystray.Menu(
                 *[pystray.MenuItem(name, self._source_action(c),
                                    checked=lambda i, c=c: self.source == c,
                                    radio=True)

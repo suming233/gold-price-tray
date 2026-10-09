@@ -9,6 +9,8 @@ import time
 import threading
 import queue
 import urllib.request
+import urllib.parse
+from datetime import datetime
 import tkinter as tk
 from quote_http import open_quote
 
@@ -18,6 +20,49 @@ FONT_REG  = "Microsoft YaHei UI"
 # 国际现货黄金（伦敦金）——24h 连续交易，全球黄金基准价
 KLINE_SYMBOL = "XAU"
 OZ_TO_GRAM = 31.1035  # 1 盎司 = 31.1035 克
+ZHESHANG_CODE = "ZS_JCN"
+ZHESHANG_NAME = "浙商银行积存金"
+CHART_MARKETS = {ZHESHANG_CODE: ZHESHANG_NAME, "hf_XAU": "伦敦金参考行情"}
+
+
+def fetch_zheshang_history(mode):
+    """京东浙商产品官方图表接口；银行买入报价，原生人民币元/克。"""
+    if mode == "day":
+        endpoint = "cfGetPriceTrendChart"
+        payload = dict(appChannel="11", beginTime="", priceType="buy", productSku="1961543816")
+    else:
+        endpoint = "cfGetQuotesPriceKLine"
+        payload = dict(productSku="1961543816", periodType="m1")
+    body = urllib.parse.urlencode({"reqData": json.dumps(payload)}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.jdjygold.com/gw2/generic/hj/h5/m/" + endpoint, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                 "Referer": "https://m.jdjygold.com/", "User-Agent": "Mozilla/5.0"})
+    with open_quote(req, timeout=10) as response:
+        obj = json.loads(response.read().decode("utf-8"))
+    result = obj.get("resultData") or {}
+    if obj.get("success") is not True or result.get("code") != "00000000":
+        raise ValueError("浙商历史行情暂不可用")
+    data = result.get("data") or {}
+    entries = data.get("dataList" if mode == "day" else "line") or []
+    rows = {}
+    for entry in entries:
+        try:
+            if mode == "day":
+                stamp = datetime.strptime(entry["goldPriceTime"], "%Y-%m-%d %H:%M:%S")
+                price = float(entry["goldPrice"])
+                label = stamp.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                stamp = datetime.strptime(entry["date"], "%Y%m%d")
+                price = float(entry["price"])
+                label = stamp.strftime("%Y-%m-%d")
+            if math.isfinite(price) and 50 < price < 100000:
+                rows[label] = price
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not rows:
+        raise ValueError("浙商历史行情暂无有效数据")
+    return sorted(rows.items())
 
 
 def fetch_usdcny():
@@ -168,6 +213,7 @@ class ChartWindow:
 
     def __init__(self, get_quote, master=None):
         self.get_quote = get_quote
+        self.market = ZHESHANG_CODE
         self.mode = "day"
         self.data = []
         self.title_line = "加载中…"
@@ -179,12 +225,14 @@ class ChartWindow:
         self._request_id = 0
         self._closed = False
         self._poll_id = None
+        self._last_refresh = 0.0
+        self._loading = False
         self.root = tk.Toplevel(master) if master is not None else tk.Tk()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         scale = max(1.0, self.root.winfo_fpixels('1i') / 96.0)
         self.PAD_L, self.PAD_R, self.PAD_T, self.PAD_B = (
             round(value * scale) for value in (62, 20, 46, 36))
-        self.root.title("金价走势 · GoldPriceTray")
+        self.root.title("浙商黄金走势 · GoldPriceTray")
         self.root.geometry(f"{round(self.W * scale)}x{round(self.H * scale)}")
         self.root.minsize(round(600 * scale), round(360 * scale))
         self.root.configure(bg="#1e1f22")
@@ -202,6 +250,16 @@ class ChartWindow:
         self.lbl_price = tk.Label(top, text="", bg="#1e1f22",
                                   font=(FONT_BOLD, 15))
         self.lbl_price.pack(side="right")
+
+        markets = tk.Frame(self.root, bg="#1e1f22")
+        markets.pack(fill="x", padx=10, pady=(0, 4))
+        self.market_buttons = {}
+        for code, name in CHART_MARKETS.items():
+            button = tk.Button(markets, text=name, command=lambda c=code: self.switch_market(c),
+                               relief="flat", padx=12, pady=3,
+                               font=(FONT_REG, 10), cursor="hand2")
+            button.pack(side="left", padx=(0, 8))
+            self.market_buttons[code] = button
 
         btns = tk.Frame(self.root, bg="#1e1f22")
         btns.pack(fill="x", padx=10)
@@ -227,12 +285,23 @@ class ChartWindow:
         return b
 
     def _refresh_btn_style(self):
+        for code, button in self.market_buttons.items():
+            button.configure(bg="#3d4050" if code == self.market else "#2a2b30",
+                             fg="#ffffff" if code == self.market else "#c8c8c8")
         active = {"day": self.btn_day, "week": self.btn_week, "month": self.btn_month}
         for mode, b in active.items():
             if mode == self.mode:
                 b.configure(bg="#3d4050", fg="#ffffff")
             else:
                 b.configure(bg="#2a2b30", fg="#c8c8c8")
+
+    def switch_market(self, market):
+        if market not in CHART_MARKETS:
+            return
+        self.market = market
+        self.root.title(f"{CHART_MARKETS[market]}走势 · GoldPriceTray")
+        self._refresh_btn_style()
+        self.load_data()
 
     def switch(self, mode):
         self.mode = mode
@@ -241,17 +310,21 @@ class ChartWindow:
 
     def load_data(self):
         self._request_id += 1
-        request_id, mode = self._request_id, self.mode
-        self.title_line = "加载中…"
+        request_id, mode, market = self._request_id, self.mode, self.market
+        self._loading = True
+        self._last_refresh = time.monotonic()
+        self.title_line = f"{CHART_MARKETS[market]} 加载中…"
         self.data = []
         self.prev_line = None
         self.lbl_price.configure(text="")
         self._redraw()
-        threading.Thread(target=self._fetch_worker, args=(request_id, mode), daemon=True).start()
+        threading.Thread(target=self._fetch_worker, args=(request_id, mode, market), daemon=True).start()
 
-    def _fetch_worker(self, request_id, mode):
+    def _fetch_worker(self, request_id, mode, market):
         try:
-            if mode == "day":
+            if market == ZHESHANG_CODE:
+                result = self._fetch_zheshang(mode)
+            elif mode == "day":
                 result = self._fetch_day()
             elif mode == "week":
                 result = self._fetch_daily(5)
@@ -260,6 +333,49 @@ class ChartWindow:
         except Exception as e:
             result = {"error": str(e)}
         self.q.put((request_id, result))
+
+    def _fetch_zheshang(self, mode):
+        rows = fetch_zheshang_history(mode)
+        name = ZHESHANG_NAME
+        prev_line = None
+        if mode == "day":
+            q = self.get_quote()
+            if not q or q.get("code") != ZHESHANG_CODE or q.get("stale"):
+                # 用户将托盘切到其他品种时，图表仍独立优先使用浙商行情。
+                from gold_price_tray import fetch_zheshang_quote
+                q = fetch_zheshang_quote(include_reference=False)
+            if not q or "error" in q or q.get("stale"):
+                q = None
+            data_date = rows[-1][0][:10]
+            rows = [(stamp, price) for stamp, price in rows if stamp.startswith(data_date)]
+            if q and q.get("date") == data_date:
+                stamp = f"{q['date']} {q['time']}"
+                if stamp >= rows[-1][0]:
+                    if stamp == rows[-1][0]:
+                        rows[-1] = (stamp, q["price"])
+                    else:
+                        rows.append((stamp, q["price"]))
+                prev = q.get("prev")
+                if prev:
+                    prev_line = (prev, f"昨收 {prev:.2f}")
+            else:
+                prev = None
+            cur = rows[-1][1]
+            chg = cur - prev if prev else None
+            pct = chg / prev * 100 if prev else None
+            span = "当日分时" if data_date == time.strftime("%Y-%m-%d") else f"最近交易日 {data_date}"
+            data = [(stamp[11:16], price) for stamp, price in rows]
+            note = "京东浙商产品买入报价"
+        else:
+            if mode == "week":
+                rows = rows[-5:]
+            cur, first = rows[-1][1], rows[0][1]
+            chg, pct = cur - first, (cur - first) / first * 100
+            span = "近一周" if mode == "week" else "近一月"
+            data = [(stamp[5:], price) for stamp, price in rows]
+            note = "京东浙商产品历史报价 · 涨跌相对区间首日"
+        return dict(data=data, latest=(cur, chg, pct, name), title=f"{name} {span}",
+                    prev_line=prev_line, data_time=rows[-1][0], unit="元/克", note=note)
 
     def _fetch_day(self):
         q = fetch_kline_quote(self.get_quote())
@@ -316,6 +432,7 @@ class ChartWindow:
                 request_id, result = self.q.get_nowait()
                 if request_id != self._request_id:
                     continue
+                self._loading = False
                 if "error" in result:
                     self.title_line = f"数据获取失败: {result['error']}"
                     self.data = []
@@ -328,9 +445,13 @@ class ChartWindow:
                     self.prev_line = result["prev_line"]
                     self.data_time = result["data_time"]
                     self.unit = result["unit"]
+                    self.note = result.get("note", "伦敦金参考行情")
                 self._redraw()
         except queue.Empty:
             pass
+        if (hasattr(self, "_last_refresh") and not self._loading
+                and time.monotonic() - self._last_refresh >= 30):
+            self.load_data()
         self._poll_id = self.root.after(80, self._poll)
 
     def close(self):
@@ -343,7 +464,9 @@ class ChartWindow:
     def _redraw(self):
         if self.data:
             cur, chg, pct, name = self.latest
-            if chg > 0:
+            if chg is None:
+                c = "#c8c8c8"
+            elif chg > 0:
                 c = "#eb4d4b"
             elif chg < 0:
                 c = "#2ecc71"
@@ -351,14 +474,15 @@ class ChartWindow:
                 c = "#c8c8c8"
             self.color = c
             self.lbl_price.configure(
-                text=f"{cur:.2f}   {chg:+.2f} ({pct:+.2f}%)", fg=c)
+                text=(f"{cur:.2f}   {chg:+.2f} ({pct:+.2f}%)" if chg is not None
+                      else f"{cur:.2f}   涨跌暂无"), fg=c)
             self.lbl_title.configure(text=self.title_line)
             self.lbl_status.configure(
-                text=f"伦敦金参考行情 · 元/克 · 数据时间 {self.data_time}")
+                text=f"{getattr(self, 'note', CHART_MARKETS[self.market])} · 元/克 · 数据时间 {self.data_time}")
         else:
             self.lbl_title.configure(text=self.title_line)
             self.lbl_price.configure(text="")
-            self.lbl_status.configure(text="伦敦金参考行情 · 元/克")
+            self.lbl_status.configure(text=f"{CHART_MARKETS[self.market]} · 元/克")
         self.draw()
 
     def draw(self):
@@ -436,7 +560,7 @@ class ChartWindow:
         idx = max(0, min(n - 1, round(x / cw * (n - 1))))
         lab, price = self.data[idx]
         unit = getattr(self, "unit", "美元/盎司")
-        self.lbl_status.configure(text=f"{lab}   价格 {price:.2f} {unit}")
+        self.lbl_status.configure(text=f"{CHART_MARKETS[self.market]} · {lab}   价格 {price:.2f} {unit}")
 
     def run(self):
         self.root.mainloop()
