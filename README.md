@@ -19,11 +19,13 @@
 ## 功能
 
 - **托盘图标显示实时金价**，默认显示**浙商银行积存金**（元/克）
-- **悬停详情卡**：价格数字 46px 加粗并单独染涨跌色，单位与其余信息用小字
-- **走势图**：双击图标打开，可切换当日分时 / 近一周 / 近一月
-- **品种切换**：浙商银行积存金（默认）、伦敦金 XAU/USD、纽约黄金、沪金 99、黄金 T+D
+- **悬停详情卡**：整体按 1.5 倍放大，价格数字 69px 加粗并单独染涨跌色，单位与其余信息用小字
+- **走势图**：单击或双击图标打开伦敦金参考行情，可切换当日分时 / 近一周 / 近一月；重复打开复用窗口
+- **品种切换**：浙商银行积存金（默认）、伦敦金 XAU/USD、纽约黄金、沪金 99、黄金 T+D，重启后保留选择
 - **涨红跌绿**，符合国内行情习惯
 - 每 30 秒自动刷新，支持开机自启
+- 同品种更新失败时保留上次报价，并在提示与悬停卡标注；切换品种会先显示加载状态
+- 行情请求直接联网，不继承环境代理；汇率不可用时不会把美元价格误标为元/克
 - 单实例互斥，重复启动不会多出图标
 - **磁盘占用有界**：日志只在有意义的事件上落盘并自动轮转（见下）
 
@@ -83,7 +85,7 @@ windows-latest 上打包，并把 `GoldPriceTray_Setup.exe` 挂到对应的 Rele
 | --- | --- |
 | 只记有意义的事 | 首次取到价、涨跌方向翻转（10 分钟最小间隔）、取数失败、失败恢复、每小时心跳 |
 | 不记的内容 | 每 30 秒一次的正常刷新结果 —— 托盘图标本身就是实时显示，日志里再抄一遍没有信息量 |
-| 大小轮转 | 超过 256 KB 只保留最后 800 行 |
+| 大小轮转 | 按字节限制为 256 KB，轮转时最多保留 800 行，异常消息也有长度上限 |
 
 实测一天的实际写入量：
 
@@ -129,7 +131,8 @@ price right on your taskbar — by default the **China Zheshang Bank gold
 accumulation plan** quote (CNY per gram).
 
 - Tray icon shows the live price; hover for a detailed pop-up card
-- Double-click the icon for intraday / 1-week / 1-month charts
+- Click the icon for London gold reference charts; intraday / 1-week / 1-month views
+- Remembers the selected symbol; marks cached quotes when updates fail
 - Multiple symbols: Zheshang accumulation gold, London gold, COMEX gold,
   SHFE gold, Gold T+D
 - Refreshes every 30 s; optional start-up with Windows; single-instance guard

@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 r"""
-GoldPriceTray —— Windows 任务栏托盘实时金价小工具 (v3.10 自安装版)
+GoldPriceTray —— Windows 任务栏托盘实时金价小工具 (v3.11.1 自安装版)
 ==================================================================
 - 托盘图标直接显示实时金价数字（默认**浙商银行积存金**，元/克）
 - 国际金价（美元/盎司）自动按实时汇率换算为人民币计价（元/克）显示
 - 涨红跌绿（相对昨日收盘/昨结）
 - 鼠标**停在托盘图标本体上**（精确定位图标矩形 + 停留 1 秒）→ 弹出实时金价悬浮卡：
-  价格 46px 大字号、单独染涨跌色，单位与其余信息用小字
+  详情卡整体放大 1.5 倍，价格 69px 大字号、单独染涨跌色，单位与其余信息用小字
 - 悬停期间**主动清空系统原生 tooltip**（鼠标一进图标热区就把 szTip 置空），
-  保证屏幕上只有悬浮卡一个界面；移出后恢复文本，供 UIAutomation 定位图标用
+  保证屏幕上只有悬浮卡一个界面；移出后恢复文本
 - 划到通知区域其他地方不会弹，前台跑全屏程序时一律不弹
 - 每 30 秒自动刷新
 - 日志有界：只在首次取价 / 涨跌转向 / 出错与恢复 / 每小时心跳时落盘，
@@ -34,6 +34,8 @@ import re
 import os
 import sys
 import json
+import math
+import queue
 import time
 import shutil
 import ctypes
@@ -41,6 +43,27 @@ import tempfile
 import threading
 import subprocess
 import urllib.request
+from quote_http import open_quote
+
+
+def enable_dpi_awareness():
+    """Use physical screen coordinates consistently for tray, pointer and Tk."""
+    try:
+        fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        fn.argtypes = [ctypes.c_void_p]
+        if fn(ctypes.c_void_p(-4)):  # PER_MONITOR_AWARE_V2
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
 
 # --windowed 单文件模式下没有 stderr，faulthandler 需跳过
 try:
@@ -88,6 +111,13 @@ HOVER_DELAY_MS = 1000
 # 注意它必须与 _hit_test 的"桥"区域配合 —— 光靠宽限期会显得迟钝。
 HIDE_GRACE_MS = 250
 
+# 悬浮行情卡的统一视觉比例；字体、控件间距和定位间距同步缩放。
+HOVER_CARD_SCALE = 1.5
+
+
+def _card_px(value):
+    return int(value * HOVER_CARD_SCALE + 0.5)
+
 # 用户可在 %LOCALAPPDATA%\GoldPriceTray\settings.json 覆写悬停延迟，
 # 方便不用重新打包 exe 就能调手感（{"hover_delay_ms": 600}）。
 _SETTINGS_FILE = os.path.join(
@@ -111,6 +141,36 @@ def load_hover_delay_ms():
         return max(0, min(v, 10000))
     except Exception:
         return HOVER_DELAY_MS
+
+
+_settings_lock = threading.Lock()
+
+
+def load_source():
+    try:
+        with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            code = json.load(f).get("source")
+        return code if isinstance(code, str) and code in SOURCES else DEFAULT_SOURCE
+    except Exception:
+        return DEFAULT_SOURCE
+
+
+def save_source(code):
+    """Preserve other settings and replace the file atomically."""
+    with _settings_lock:
+        try:
+            with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if not isinstance(settings, dict):
+                settings = {}
+        except (OSError, ValueError):
+            settings = {}
+        settings["source"] = code
+        os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
+        temporary = _SETTINGS_FILE + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, _SETTINGS_FILE)
 
 
 def _find_system_font(names):
@@ -156,7 +216,7 @@ def fetch_usdcny():
     url = "https://hq.sinajs.cn/list=fx_susdcny"
     req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with open_quote(req, timeout=8) as r:
             raw = r.read().decode("gbk", errors="ignore")
         m = re.search(r'"([^"]*)"', raw)
         if not m or not m.group(1).strip():
@@ -194,7 +254,7 @@ def _fetch_sina(code: str):
     url = f"https://hq.sinajs.cn/list={code}"
     req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with open_quote(req, timeout=8) as r:
             raw = r.read().decode("gbk", errors="ignore")
         m = re.search(r'"([^"]*)"', raw)
         if not m or not m.group(1).strip():
@@ -207,15 +267,20 @@ def _fetch_sina(code: str):
         high  = float(f[4]) if f[4] else 0.0
         low   = float(f[5]) if f[5] else 0.0
         open_ = float(f[8]) if f[8] else 0.0
+        if not all(math.isfinite(v) and v > 0 for v in
+                   (price, prev, high, low, open_)):
+            return {"error": "新浪报价为空或异常"}
         q = {
             "code": code, "name": f[13], "price": price, "prev": prev,
             "high": high, "low": low, "open": open_,
             "time": f[6], "date": f[12],
-            "cny": False, "rate": None, "usd_price": None,
+            "cny": not code.startswith("hf_"), "rate": None, "usd_price": None,
             "unit": "美元/盎司" if code.startswith("hf_") else "元/克",
         }
         if code.startswith("hf_"):
             rate = _get_cny_rate()
+            if not rate:
+                return {"error": "无法获取美元兑人民币汇率，暂不能换算元/克"}
             if rate:
                 k = rate / OZ_TO_GRAM
                 q["usd_price"] = price
@@ -261,7 +326,7 @@ def fetch_zheshang_quote():
             "Referer": "https://m.jd.com/",
             "Accept": "application/json, text/plain, */*",
         })
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with open_quote(req, timeout=8) as r:
             raw = r.read().decode("utf-8", errors="ignore")
         d = json.loads(raw)
         if not d.get("success"):
@@ -269,7 +334,7 @@ def fetch_zheshang_quote():
         ds = (d.get("resultData") or {}).get("datas") or {}
         price = float(ds.get("price") or 0)
         prev = float(ds.get("yesterdayPrice") or 0)
-        if not (50.0 < price < 100000.0) or prev <= 0:
+        if not (50.0 < price < 100000.0) or not math.isfinite(prev) or prev <= 0:
             return {"error": "浙商积存金报价异常"}
         amt = ds.get("upAndDownAmt")
         amt = float(amt) if amt not in (None, "") else price - prev
@@ -277,8 +342,13 @@ def fetch_zheshang_quote():
             pct = float(str(ds.get("upAndDownRate") or "").rstrip("%"))
         except ValueError:
             pct = amt / prev * 100
+        if not math.isfinite(amt) or not math.isfinite(pct):
+            return {"error": "浙商积存金涨跌数据异常"}
         try:
-            dt = time.localtime(int(ds.get("time") or 0) / 1000)
+            timestamp = int(ds.get("time") or 0)
+            if timestamp <= 0:
+                raise ValueError("缺少行情时间")
+            dt = time.localtime(timestamp / 1000)
         except Exception:
             dt = time.localtime()
         q = {
@@ -308,7 +378,7 @@ def _get_spot_reference():
     if _ref_cache["quote"] and now - _ref_cache["ts"] < 300:
         return _ref_cache["quote"]
     ref = _fetch_sina("hf_XAU")
-    if ref and "price" in ref:
+    if ref and "price" in ref and ref.get("cny"):
         out = {"ref_price": ref["price"], "ref_name": "伦敦金"}
         _ref_cache["quote"] = out
         _ref_cache["ts"] = now
@@ -318,6 +388,8 @@ def _get_spot_reference():
 
 def fetch_quote(code: str):
     """统一取数入口：浙商积存金走京东金融接口，其余走新浪行情。"""
+    if not isinstance(code, str) or code not in SOURCES:
+        return {"error": "无效的金价品种"}
     if code == DEFAULT_SOURCE:
         return fetch_zheshang_quote()
     return _fetch_sina(code)
@@ -351,6 +423,11 @@ def _get_tray_rect():
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowExW.restype = wintypes.HWND
+        user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         tray = user32.FindWindowW("Shell_TrayWnd", None)
         if not tray:
             return None
@@ -377,208 +454,103 @@ def _cursor_pos():
         return None
 
 
-class _SAFEARRAY(ctypes.Structure):
-    """UIA 的 BoundingRectangle 是 VT_ARRAY|VT_R8（SAFEARRAY of double）。
-    前 16 字节是结构头，真正的数据在 pvData 指向处 —— 直接把 union 指针
-    当 double* 读，读到的是头部（全 0），这是定位失败的第一个原因。"""
-    _fields_ = [("cDims", ctypes.c_ushort),
-                ("fFeatures", ctypes.c_ushort),
-                ("cbElements", ctypes.c_ulong),
-                ("cLocks", ctypes.c_ulong),
-                ("pvData", ctypes.c_void_p),
-                ("rgsabound", ctypes.c_ulong * 2)]
+def _tray_icon_hwnd(icon=None):
+    """Get the exact rectangle of our own icon, without UIA name matching.
 
-
-def _uia_rect(var):
-    """从 VT_ARRAY|VT_R8 的 VARIANT 取出矩形，返回 (x, y, w, h)。
-    注意 UIA 给的顺序是 left, top, WIDTH, HEIGHT —— 不是 right/bottom。
-    这是定位失败的第二个原因。"""
+    pystray 0.19.5's Windows backend registers uID=0 with a unique HWND.
+    Shell_NotifyIconGetRect works even while the tooltip text is empty.
+    Failure returns None; never substitute the entire notification area.
+    """
     try:
-        if var.vt != 0x2005 or not var.val:
+        from ctypes import wintypes
+
+        class NOTIFYICONIDENTIFIER(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                        ("uID", wintypes.UINT), ("guidItem", ctypes.c_byte * 16)]
+
+        hwnd = getattr(icon, "_hwnd", None)
+        if not hwnd or not icon.visible:
             return None
-        sa = ctypes.cast(ctypes.c_void_p(var.val), ctypes.POINTER(_SAFEARRAY))
-        if not sa.contents.pvData:
+        identity = NOTIFYICONIDENTIFIER()
+        identity.cbSize = ctypes.sizeof(identity)
+        identity.hWnd = hwnd
+        # _win32.Icon._message passes hID, while the struct field is uID.
+        # ctypes leaves the actual uID at zero. Match the registered value.
+        identity.uID = 0
+        rect = wintypes.RECT()
+        fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.POINTER(NOTIFYICONIDENTIFIER),
+                                ctypes.POINTER(wintypes.RECT))(
+                                    ("Shell_NotifyIconGetRect", ctypes.windll.shell32))
+        if fn(ctypes.byref(identity), ctypes.byref(rect)) != 0:
             return None
-        d = ctypes.cast(sa.contents.pvData, ctypes.POINTER(ctypes.c_double))
-        return (d[0], d[1], d[2], d[3])
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return rect.left, rect.top, rect.right, rect.bottom
     except Exception:
         return None
 
 
-def _title_candidates():
-    """定位本程序托盘图标的名字关键词（统一小写）。
+def _monitor_rect(pos=None, hwnd=None, work=False):
+    from ctypes import wintypes
 
-    UIA 读到的 Name 就是托盘 tooltip 全文，前缀是品种名（稳定），
-    后缀是价格与时间（每次刷新都变），所以既给完整 title 也给前缀片段，
-    最后用品种名与单位兜底。"""
-    out = []
-    t = (_g_tray_title or "").strip()
-    if t:
-        out.append(t)
-        head = t.split("\n")[0].strip()
-        if len(head) >= 4:
-            out.append(head[:14])
-            out.append(head.split(" ")[0].strip())
-    for disp in SOURCES.values():
-        nm = re.split(r"[(（]", disp)[0].strip()
-        if nm:
-            out.append(nm)
-    out.append("元/克")
-    out.append("美元/盎司")
-    seen, uniq = set(), []
-    for c in out:
-        c = (c or "").strip().lower()
-        if c and c not in seen:
-            seen.add(c)
-            uniq.append(c)
-    return uniq
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    u = ctypes.windll.user32
+    if hwnd:
+        fn = u.MonitorFromWindow
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD]
+        fn.restype = wintypes.HANDLE
+        monitor = fn(hwnd, 2)
+    else:
+        fn = u.MonitorFromPoint
+        fn.argtypes = [wintypes.POINT, wintypes.DWORD]
+        fn.restype = wintypes.HANDLE
+        monitor = fn(wintypes.POINT(*(pos or (0, 0))), 2)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    u.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+    if not u.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise OSError("Cannot query monitor")
+    rect = info.rcWork if work else info.rcMonitor
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _clamp_card_position(x, y, width, height, pos):
+    try:
+        left, top, right, bottom = _monitor_rect(pos=pos, work=True)
+        x = max(left + 8, min(x, right - width - 8))
+        y = max(top + 8, min(y, bottom - height - 8))
+    except Exception:
+        pass
+    return int(x), int(y)
 
 
 def _is_fullscreen_foreground():
-    """前台窗口是否全屏铺满整个屏幕（游戏 / 全屏视频）。
-
-    用于抑制悬浮卡，保住游戏沉浸感。判据取"窗口矩形完全覆盖整屏"：
-    Windows 的最大化窗口只占工作区（不含任务栏），因此不会误判。"""
+    """Check the foreground window against the monitor containing it."""
     try:
         from ctypes import wintypes
         u = ctypes.windll.user32
+        u.GetForegroundWindow.restype = wintypes.HWND
         hwnd = u.GetForegroundWindow()
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
         if not hwnd or not u.IsWindowVisible(hwnd):
             return False
         buf = ctypes.create_unicode_buffer(64)
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         u.GetClassNameW(hwnd, buf, 64)
-        if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd",
-                         "Windows.UI.Core.CoreWindow",
-                         "XamlExplorerHostIslandWindow"):
+        if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+                         "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow"):
             return False
-        r = wintypes.RECT()
-        if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+        rect = wintypes.RECT()
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        if not u.GetWindowRect(hwnd, ctypes.byref(rect)):
             return False
-        sw, sh = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
-        return (r.left <= 0 and r.top <= 0 and
-                r.right >= sw and r.bottom >= sh)
+        l, t, r, b = _monitor_rect(hwnd=hwnd)
+        return rect.left <= l and rect.top <= t and rect.right >= r and rect.bottom >= b
     except Exception:
         return False
-
-
-def _tray_icon_hwnd():
-    """取本程序托盘图标的精确屏幕矩形 (l, t, r, b)。
-
-    用 UIAutomation 在 Shell_TrayWnd 子树里按 tooltip 名字定位本程序图标，
-    再读 CurrentBoundingRectangle。返回 None 表示定位失败 —— 调用方
-    **不得**回退到"整个通知区域"，否则鼠标划到右下角就会弹卡。"""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        from ctypes import WINFUNCTYPE, POINTER, byref
-        from ctypes.wintypes import BOOL, HWND, LONG, LPARAM, LPCWSTR, UINT
-
-        # ---- UIAutomation 最小接口（COM，无需第三方库）----
-        class GUID(ctypes.Structure):
-            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
-                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
-
-        class VARIANT(ctypes.Structure):
-            _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
-                        ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
-                        ("val", ctypes.c_longlong)]
-
-        def _guid(s):
-            """解析 '8-4-4-4-12' 形式的 GUID 字符串（按连字符分段，不能用固定偏移切）。"""
-            p = s.strip().strip("{}").split("-")
-            return GUID(int(p[0], 16), int(p[1], 16), int(p[2], 16),
-                        (ctypes.c_ubyte * 8)(*bytes.fromhex(p[3] + p[4])))
-
-        # HRESULT 是 32 位有符号，Win64 上用 c_int32 显式声明，
-        # 且必须让 ctypes 看到完整 4 字节，否则可能误判成功/失败。
-        HRESULT = ctypes.c_int32
-        c_hr = ctypes.c_int32
-
-        def _call(ptr, index, restype, *argtypes):
-            """取 COM 接口虚表第 index 个方法的可调用对象。
-            注意：必须先从槽位读出函数地址，直接对槽位地址建回调会跳进数据区。"""
-            base = ctypes.cast(ptr, POINTER(ctypes.c_void_p))[0]
-            addr = ctypes.c_void_p.from_address(
-                base + index * ctypes.sizeof(ctypes.c_void_p)).value
-            proto = WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
-            return proto(addr)
-
-        ole32 = ctypes.windll.ole32
-        user32 = ctypes.windll.user32
-        CLSID_CUIAutomation = _guid("FF48DBA4-60EF-4201-AA87-54103EEF594E")
-        IID_IUIAutomation = _guid("30CBE57D-D9D0-452A-AB13-7AC5AC4825EE")
-
-        ole32.CoInitialize(None)
-        p_auto = ctypes.c_void_p()
-        if ole32.CoCreateInstance(byref(CLSID_CUIAutomation), None, 1,
-                                  byref(IID_IUIAutomation), byref(p_auto)) != 0:
-            return None
-
-        # ElementFromHandle(HWND) → IUIAutomationElement*   (vtable #6)
-        hwnd_tray = user32.FindWindowW("Shell_TrayWnd", None)
-        if not hwnd_tray:
-            return None
-        p_root = ctypes.c_void_p()
-        if _call(p_auto, 6, HRESULT, HWND, ctypes.POINTER(ctypes.c_void_p))(
-                p_auto, HWND(hwnd_tray), byref(p_root)) < 0 or not p_root:
-            return None
-
-        # FindAll(TreeScope_Descendants=4, TrueCondition, out arr)
-        # 槽位取自 UIAutomationCore 类型库（见下方注释），非猜测值：
-        #   IUIAutomation          #6=ElementFromHandle  #21=CreateTrueCondition
-        #   IUIAutomationElement   #6=FindAll            #10=GetCurrentPropertyValue
-        #   IUIAutomationElementArray #3=get_Length      #4=GetElement
-        p_cond = ctypes.c_void_p()
-        if _call(p_auto, 21, HRESULT, ctypes.POINTER(ctypes.c_void_p))(
-                p_auto, byref(p_cond)) < 0 or not p_cond.value:
-            return None
-        p_arr = ctypes.c_void_p()
-        if _call(p_root, 6, HRESULT, ctypes.c_int, ctypes.c_void_p,
-                 ctypes.POINTER(ctypes.c_void_p))(p_root, 4, p_cond,
-                 byref(p_arr)) < 0 or not p_arr.value:
-            return None
-
-        # IUIAutomationElementArray::get_Length  (vtable #3) / GetElement (vtable #4)
-        n = ctypes.c_int()
-        _call(p_arr, 3, HRESULT, ctypes.POINTER(ctypes.c_int))(p_arr, byref(n))
-
-        # 本程序的图标名：优先 pystray 当前 title，兜底用默认名
-        wanted = _title_candidates()
-        tray_hint = _get_tray_rect()
-
-        P = ctypes.POINTER(ctypes.c_void_p)
-        found = None
-        for i in range(min(max(n.value, 0), 400)):
-            p_el = ctypes.c_void_p()
-            if _call(p_arr, 4, HRESULT, ctypes.c_int, P)(p_arr, i, byref(p_el)) < 0 or not p_el:
-                continue
-            # CurrentName 属性：GetCurrentPropertyValue(PropertyId=30005)
-            var = VARIANT()
-            fn_prop = _call(p_el, 10, HRESULT, ctypes.c_int, ctypes.POINTER(VARIANT))
-            if fn_prop(p_el, 30005, byref(var)) >= 0 and var.vt == 8:   # VT_BSTR
-                name = ctypes.cast(ctypes.c_void_p(var.val), ctypes.c_wchar_p).value or ""
-                low = name.lower()
-                if name and any(k in low for k in wanted):
-                    # CurrentBoundingRectangle：PropertyId=30001
-                    v2 = VARIANT()
-                    if fn_prop(p_el, 30001, byref(v2)) >= 0:
-                        box = _uia_rect(v2)
-                        if box:
-                            # UIA 返回 (left, top, width, height)，换算成 l/t/r/b
-                            x, y, w, h = box
-                            l, t, r, b = int(x), int(y), int(x + w), int(y + h)
-                            # 必须落在通知区域内：排除别处同名元素造成的误匹配
-                            if (tray_hint is None or
-                                    (tray_hint[0] - 8 <= l <= tray_hint[2] + 8 and
-                                     tray_hint[1] - 8 <= t <= tray_hint[3] + 8)):
-                                found = (l, t, r, b)
-            _call(p_el, 2, ctypes.c_uint32)(p_el)   # Release
-        _call(p_arr, 2, ctypes.c_uint32)(p_arr)
-        _call(p_root, 2, ctypes.c_uint32)(p_root)
-        _call(p_auto, 2, ctypes.c_uint32)(p_auto)
-        return found
-    except Exception:
-        return None
 
 
 class HoverCard:
@@ -595,8 +567,12 @@ class HoverCard:
     FG_MAIN = "#F2F3F7"
     FG_SUB  = "#C7CBD9"
 
-    def __init__(self, get_quote, on_active=None, on_zone=None):
+    def __init__(self, get_quote, on_active=None, on_zone=None, get_icon=None, on_uninstall=None):
         self.get_quote = get_quote
+        self.get_icon = get_icon or (lambda: None)
+        self.commands = queue.Queue()
+        self.chart_window = None
+        self.on_uninstall = on_uninstall
         self.on_active = on_active
         self.on_zone = on_zone      # 进入/离开图标热区时回调（用于抢在系统 tooltip 之前清空它）
         self.zone = False           # 鼠标当前是否落在图标热区内
@@ -609,17 +585,41 @@ class HoverCard:
         self.delay_ms = load_hover_delay_ms()
         self._enter_ts = None          # 本次进入图标区的时刻；移出即清零
         self._leave_ts = None          # 本次离开热区的时刻；宽限期用它计时
-        self._icon_rect = None         # 本程序托盘图标矩形（缓存）
-        self._icon_rect_ts = 0.0       # 上次尝试解析图标的时刻
-        self._icon_rect_misses = 0    # 连续失败次数，多次失败后只走通知区兜底
+        self._icon_rect = None         # 本次轮询取得的图标矩形
+        self._thread = None
 
     def start(self):
         if not TK_OK:
             return
-        threading.Thread(target=self._run, daemon=True).start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self._stop = True
+
+    def open_chart(self):
+        self.commands.put("chart")
+
+    def _drain_commands(self):
+        try:
+            while True:
+                command = self.commands.get_nowait()
+                if command == "chart":
+                    import chart
+                    if self.chart_window and self.chart_window.root.winfo_exists():
+                        self.chart_window.root.deiconify()
+                        self.chart_window.root.lift()
+                        self.chart_window.root.focus_force()
+                    else:
+                        self.chart_window = chart.ChartWindow(self.get_quote, master=self.root)
+                elif command == "uninstall":
+                    from tkinter import messagebox
+                    if messagebox.askyesno("卸载金价托盘", "将移除程序、自启、快捷方式与设置。确定卸载吗？",
+                                           parent=self.root):
+                        if self.on_uninstall:
+                            self.on_uninstall()
+        except queue.Empty:
+            pass
 
     @property
     def active(self):
@@ -635,22 +635,37 @@ class HoverCard:
             self.root.withdraw()
             self._poll()
             self.root.mainloop()
-        except Exception:
-            pass
+        except Exception as exc:
+            GoldTray._log(f"hover UI error: {exc}")
+        finally:
+            self.zone = False
+            self.visible = False
+            if self.on_zone:
+                self.on_zone(False)
+            if self.root is not None:
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+            # Release Tk objects on their owning thread.
+            self._labels.clear()
+            self.chart_window = None
+            self.root = None
 
     def _build(self):
         # v3.7：价格数字放大成主角（27→46px），其余信息相应缩小；
         # 单位"元/克"拆成独立小字贴在数字右下，避免跟着数字一起变大。
-        f_price = tkfont.Font(family="Microsoft YaHei UI", size=-46, weight="bold")
-        f_unit  = tkfont.Font(family="Microsoft YaHei UI", size=-13)
-        f_chg   = tkfont.Font(family="Microsoft YaHei UI", size=-14, weight="bold")
-        f_name  = tkfont.Font(family="Microsoft YaHei UI", size=-13)
-        f_sub   = tkfont.Font(family="Microsoft YaHei UI", size=-11)
+        f_price = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=-_card_px(46), weight="bold")
+        f_unit  = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=-_card_px(13))
+        f_chg   = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=-_card_px(14), weight="bold")
+        f_name  = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=-_card_px(13))
+        f_sub   = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=-_card_px(11))
         # pady 用 (上,下) 元组微调纵向：Tk 会把行高取整，均匀 pady 会欠一点高度
-        pad = {"padx": 14, "pady": (2, 4)}
+        pad = {"padx": _card_px(14), "pady": (_card_px(2), _card_px(4))}
 
         lb = tk.Label(self.root, bg=self.BG, fg=self.FG_NAME, font=f_name,
-                      anchor="w", justify="left", bd=0, highlightthickness=0)
+                      anchor="w", justify="left", bd=0, highlightthickness=0,
+                      pady=_card_px(1))
         lb.pack(fill="x", **pad)
         self._labels["name"] = lb
 
@@ -664,30 +679,21 @@ class HoverCard:
         self._labels["punit"] = tk.Label(
             pf, bg=self.BG, fg=self.FG_NAME, font=f_unit,
             anchor="w", bd=0, highlightthickness=0)
-        self._labels["punit"].pack(side="left", anchor="s", padx=(5, 0), pady=(0, 8))
+        self._labels["punit"].pack(side="left", anchor="s", padx=(_card_px(5), 0), pady=(0, _card_px(8)))
 
         for key, font, fg in (("chg", f_chg, self.FG_MAIN),
                               ("usd", f_sub, self.FG_SUB),
                               ("ohcl", f_sub, self.FG_SUB),
                               ("time", f_sub, self.FG_SUB)):
             lb = tk.Label(self.root, bg=self.BG, fg=fg, font=font, anchor="w",
-                          justify="left", bd=0, highlightthickness=0)
+                          justify="left", bd=0, highlightthickness=0,
+                          pady=_card_px(1))
             lb.pack(fill="x", **pad)
             self._labels[key] = lb
 
     def _icon_rect_cached(self, now):
-        """本程序托盘图标的屏幕矩形 (l,t,r,b)；从未定位成功时返回 None。
-        图标位置基本不变（除非任务栏增删图标），故 20 秒才重新解析一次；
-        重新解析失败时**保留上次成功的矩形**（比清空更稳），从未成功过才返回 None。"""
-        if now - self._icon_rect_ts < 20:
-            return self._icon_rect
-        self._icon_rect_ts = now
-        got = _tray_icon_hwnd()
-        if got:
-            self._icon_rect = got
-            self._icon_rect_misses = 0
-        else:
-            self._icon_rect_misses += 1
+        """Query the owned icon each tick; never retain a stale hot zone."""
+        self._icon_rect = _tray_icon_hwnd(self.get_icon())
         return self._icon_rect
 
     def _hit_test(self, pos, now):
@@ -724,7 +730,7 @@ class HoverCard:
                     # 桥：x 取二者并集，y 取二者之间的竖直带（上/下两种情形由
                     # min/max 统一表达）
                     bx1, bx2 = min(l, cx1), max(r, cx2)
-                    by1, by2 = min(cy2, t), max(cy1, b)
+                    by1, by2 = (cy2, t) if cy2 <= t else (b, cy1)
                     if bx1 <= pos[0] <= bx2 and by1 <= pos[1] <= by2:
                         return True
         return False
@@ -738,12 +744,17 @@ class HoverCard:
                     pass
             return
         try:
+            self._drain_commands()
             now = time.monotonic()
             # 前台是全屏程序（游戏 / 全屏视频）时一律不弹卡，保住沉浸感
             if _is_fullscreen_foreground():
                 self._enter_ts = None
                 self._leave_ts = None
                 self._hide()
+                if self.zone:
+                    self.zone = False
+                    if self.on_zone:
+                        self.on_zone(False)
                 return
             pos = _cursor_pos()
             r = _get_tray_rect()
@@ -785,29 +796,33 @@ class HoverCard:
                 self._show(q, r, pos)
             else:
                 self._hide()
-        except Exception:
-            pass
+        except Exception as exc:
+            GoldTray._log(f"hover poll error: {exc}")
         finally:
             if self.root is not None:
                 self.root.after(self.POLL_MS, self._poll)
 
     def _show(self, q, tray_rect, pos):
-        sig = (q.get("date"), q.get("time"), round(q.get("price", 0), 3))
+        sig = tuple((key, value) for key, value in sorted(q.items()))
         if sig != self._sig:
             self._sig = sig
             self._update_labels(q)
         # 定位：优先通知区域上方偏右；拿不到托盘矩形则跟随鼠标（偏移随卡片实际尺寸动态计算）
-        if tray_rect:
-            x = tray_rect[2] - self._card_w() - 36
-            y = tray_rect[1] - self._card_h() - 9
+        anchor = self._icon_rect or tray_rect
+        if anchor:
+            x = anchor[2] - self._card_w()
+            y = anchor[1] - self._card_h() - _card_px(9)
             if y < 40:
-                y = tray_rect[3] + 12
+                y = anchor[3] + _card_px(12)
         else:
-            x = pos[0] - self._card_w() - 15
-            y = pos[1] - self._card_h() - 9
+            x = pos[0] - self._card_w() - _card_px(15)
+            y = pos[1] - self._card_h() - _card_px(9)
             if y < 40:
-                y = pos[1] + 18
-        self.root.geometry(f"+{max(8, int(x))}+{int(y)}")
+                y = pos[1] + _card_px(18)
+        x, y = _clamp_card_position(int(x), int(y), self._card_w(), self._card_h(), pos)
+        # '+-100' is an absolute negative coordinate; '-100' anchors to the
+        # right edge and would put the card on the wrong monitor.
+        self.root.geometry(f"+{x}+{y}")
         self.root.update_idletasks()
         try:
             w = self.root.winfo_reqwidth()
@@ -830,14 +845,14 @@ class HoverCard:
             self.root.update_idletasks()
             return self.root.winfo_reqheight()
         except Exception:
-            return 210
+            return _card_px(210)
 
     def _card_w(self):
         try:
             self.root.update_idletasks()
             return self.root.winfo_reqwidth()
         except Exception:
-            return 217
+            return _card_px(217)
 
     def _update_labels(self, q):
         up = q["change"] > 0
@@ -872,7 +887,8 @@ class HoverCard:
             self._labels["ohcl"].configure(
                 text=f"昨收 {q['prev']:.2f}\n"
                      f"较昨收 {q['change']:+.2f} 元/克")
-        self._labels["time"].configure(text=f"时间 {q['date']} {q['time']}")
+        stale = "\n更新失败，显示上次报价" if q.get("stale") else ""
+        self._labels["time"].configure(text=f"时间 {q['date']} {q['time']}{stale}")
 
     def _hide(self):
         self._leave_ts = None
@@ -904,7 +920,7 @@ def get_autostart_status() -> bool:
 def set_autostart(enable: bool) -> bool:
     try:
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH,
                              0, winreg.KEY_SET_VALUE)
         if enable:
             # 优先注册安装目录里的正式 exe（安装器运行时自身位置不是最终位置）；
@@ -917,7 +933,12 @@ def set_autostart(enable: bool) -> bool:
                 vbs = os.path.join(base, "start_hidden.vbs")
                 target = vbs if os.path.exists(vbs) else (
                     sys.executable if _frozen() else os.path.abspath(__file__))
-            winreg.SetValueEx(key, AUTOSTART_KEY, 0, winreg.REG_SZ, f'"{target}"')
+            if not _frozen() and target.endswith(".py"):
+                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                command = f'"{pythonw if os.path.exists(pythonw) else sys.executable}" "{target}"'
+            else:
+                command = f'"{target}"'
+            winreg.SetValueEx(key, AUTOSTART_KEY, 0, winreg.REG_SZ, command)
         else:
             try:
                 winreg.DeleteValue(key, AUTOSTART_KEY)
@@ -931,7 +952,7 @@ def set_autostart(enable: bool) -> bool:
 # ---------------- 自安装 / 卸载（单文件移植版） ----------------
 APP_NAME    = "GoldPriceTray"
 APP_TITLE   = "金价托盘 GoldPriceTray"
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.11.1"
 
 RUN_KEY_PATH       = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\GoldPriceTray"
@@ -1051,8 +1072,9 @@ def _shortcut_paths():
 
 def _make_shortcuts():
     for lnk in _shortcut_paths():
-        create_shortcut(lnk, INSTALLED_EXE, workdir=INSTALL_DIR,
-                        desc="金价托盘 - 托盘实时金价小工具", icon_path=INSTALLED_EXE)
+        if not create_shortcut(lnk, INSTALLED_EXE, workdir=INSTALL_DIR,
+                               desc="金价托盘 - 托盘实时金价小工具", icon_path=INSTALLED_EXE):
+            raise OSError("无法创建快捷方式：" + lnk)
 
 
 def _remove_shortcuts():
@@ -1098,24 +1120,26 @@ def do_install(autostart=True, desktop_shortcut=True, launch=True):
     src = os.path.abspath(sys.executable)
     dst = INSTALLED_EXE
     if os.path.normcase(src) != os.path.normcase(dst):
-        # 清掉历史残留（升级安装时旧 exe 可能被占用）
+        # Stage the complete replacement before touching the installed binary.
+        staged = dst + ".new"
+        shutil.copy2(src, staged)
         old = dst + ".old"
-        if os.path.exists(old):
-            try:
-                os.remove(old)
-            except Exception:
-                pass
         if os.path.exists(dst):
             try:
-                os.remove(dst)
+                os.replace(staged, dst)
             except PermissionError:
+                os.replace(dst, old)
                 try:
-                    os.replace(dst, old)
+                    os.replace(staged, dst)
                 except Exception:
-                    pass
-        shutil.copy2(src, dst)
-    set_autostart(autostart)
-    _write_uninstall_key()
+                    os.replace(old, dst)
+                    raise
+        else:
+            os.replace(staged, dst)
+    if not set_autostart(autostart):
+        raise OSError("无法更新开机自启动配置")
+    if not _write_uninstall_key():
+        raise OSError("无法写入卸载注册信息")
     if desktop_shortcut:
         _make_shortcuts()
     if launch and os.path.exists(dst):
@@ -1126,28 +1150,66 @@ def do_install(autostart=True, desktop_shortcut=True, launch=True):
 
 def do_uninstall():
     """移除自启/卸载项/快捷方式；程序文件由延迟脚本在进程退出后删除"""
+    expected = os.path.abspath(os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"), APP_NAME))
+    if os.path.normcase(os.path.realpath(INSTALL_DIR)) != os.path.normcase(os.path.realpath(expected)):
+        raise ValueError("拒绝删除非预期的安装路径")
+    script = None
+    if os.path.isdir(INSTALL_DIR):
+        fd, script = tempfile.mkstemp(prefix="GoldPriceTray_uninstall_", suffix=".ps1")
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+            f.write(_uninstall_script(INSTALL_DIR, INSTALLED_EXE))
+        powershell = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                                 "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        # Launch before removing registrations; failed launches must be visible.
+        subprocess.Popen([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", script], creationflags=subprocess.CREATE_NO_WINDOW)
     set_autostart(False)
     _delete_uninstall_key()
     _remove_shortcuts()
-    if os.path.isdir(INSTALL_DIR):
-        bat = os.path.join(tempfile.gettempdir(), "GoldPriceTray_uninstall.cmd")
-        with open(bat, "w", encoding="gbk", errors="ignore") as f:
-            f.write("@echo off\r\n")
-            f.write("ping -n 2 127.0.0.1 >nul\r\n")                # 先等卸载器退出
-            f.write("taskkill /F /IM GoldPriceTray.exe >nul 2>&1\r\n")
-            f.write("ping -n 3 127.0.0.1 >nul\r\n")
-            f.write(f'rd /S /Q "{INSTALL_DIR}"\r\n')
-            f.write('del "%~f0"\r\n')
-        subprocess.Popen(["cmd.exe", "/c", bat],
-                         creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def _uninstall_script(directory, executable):
+    def literal(value):
+        return "'" + value.replace("'", "''") + "'"
+    return ("$ErrorActionPreference = 'Stop'\n"
+            f"$targetDirectory = {literal(os.path.abspath(directory))}\n"
+            f"$targetExe = {literal(os.path.abspath(executable))}\n"
+            "Start-Sleep -Seconds 3\n"
+            "Get-CimInstance Win32_Process -Filter \"Name = 'GoldPriceTray.exe'\" | "
+            "Where-Object { $_.ExecutablePath -eq $targetExe } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }\n"
+            "for ($attempt = 0; $attempt -lt 10; $attempt++) {\n"
+            "  if (!(Test-Path -LiteralPath $targetDirectory)) { break }\n"
+            "  $resolvedTarget = (Resolve-Path -LiteralPath $targetDirectory).ProviderPath\n"
+            "  if ($resolvedTarget -ne $targetDirectory) { throw 'Unexpected uninstall path' }\n"
+            "  try { Remove-Item -LiteralPath $resolvedTarget -Recurse -Force; break }\n"
+            "  catch { Start-Sleep -Seconds 1 }\n"
+            "}\n"
+            "Remove-Item -LiteralPath $PSCommandPath -Force\n")
+
+
+_instance_mutex = None
 
 
 def _single_instance_ok():
     """已有一个托盘实例运行时，再次双击直接退出，避免双图标"""
     try:
-        h = ctypes.windll.kernel32.CreateMutexW(
-            None, False, "GoldPriceTray_SingleInstance")
-        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+        from ctypes import wintypes
+        global _instance_mutex
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel.CreateMutexW(None, False, "Local\\GoldPriceTray_SingleInstance")
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        duplicate = ctypes.get_last_error() == 183
+        if duplicate:
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle(handle)
+            return False
+        _instance_mutex = handle
+        return True
     except Exception:
         return True
 
@@ -1232,21 +1294,37 @@ def run_uninstall_window():
     r.destroy()
 
 # ---------------- 应用主体 ----------------
+class PriceIcon(pystray.Icon):
+    """Build dynamic menu text on the tray thread immediately before opening."""
+    def _on_notify(self, wparam, lparam):
+        if lparam == 0x0205:  # WM_RBUTTONUP
+            self.update_menu()
+        return super()._on_notify(wparam, lparam)
+
+
 class GoldTray:
+    _log_lock = threading.Lock()
+
     def __init__(self):
-        self.source = DEFAULT_SOURCE
+        self.source = load_source()
         self.quote = None
         self.last_error = None
         self.icon = None
         self.running = True
         self._last_title = ""
+        self._state_lock = threading.RLock()
+        self._fetch_lock = threading.Lock()
+        self._refresh_event = threading.Event()
+        self._refresh_event.set()
+        self._source_generation = 0
         # 日志节流状态：_log_ts 为上次"心跳类"日志的时刻（0 表示还没写过）；
         # _last_dir 为上次的涨跌方向，用于识别转向；_err_streak 为连续失败次数，
         # 保证一次断网只写一行而不是每 30 秒刷一行。
         self._log_ts = 0.0
         self._last_dir = None
         self._err_streak = 0
-        self.hover = HoverCard(lambda: self.quote, self._on_hover, self._on_zone)
+        self.hover = HoverCard(lambda: self.quote, self._on_hover, self._on_zone,
+                               lambda: self.icon, self._confirmed_uninstall)
 
     def _sync_tray_title(self):
         """统一维护系统原生 tooltip：只在"鼠标不在图标上"时才保留它。
@@ -1254,15 +1332,15 @@ class GoldTray:
         鼠标一进图标热区就把 szTip 清空 —— pystray 走 NIM_MODIFY + NIF_TIP，
         空串即移除 tooltip（MSDN 标准做法），这样能抢在 Windows 弹出它之前生效，
         屏幕上就只剩我们自己的悬浮卡一个界面。离开后恢复文本，是因为
-        UIAutomation 定位图标位置时还要拿 tooltip 内容当匹配关键词。"""
+        鼠标移出后恢复系统 tooltip。图标定位独立于提示文字。"""
         if not self.icon:
             return
         suppress = self.hover.zone or self.hover.active
         try:
-            self.icon.title = "" if suppress else self._last_title
+            self.icon.title = "" if suppress else self._last_title[:127]
         except Exception:
             pass
-        _set_tray_title("" if suppress else self._last_title)
+        _set_tray_title(self._last_title)
 
     def _on_hover(self, active):
         """悬浮卡显示/隐藏时同步 tooltip 状态"""
@@ -1273,7 +1351,6 @@ class GoldTray:
         self._sync_tray_title()
 
     def menu(self):
-        src = self.source
         return pystray.Menu(
             pystray.MenuItem("金价小工具 (每30秒刷新)", None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -1284,8 +1361,9 @@ class GoldTray:
             pystray.MenuItem("立即刷新", self.refresh_now),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示品种", pystray.Menu(
-                *[pystray.MenuItem(name, lambda i, c=c: self.set_source(c),
-                                   checked=lambda i, c=c: src == c)
+                *[pystray.MenuItem(name, self._source_action(c),
+                                   checked=lambda i, c=c: self.source == c,
+                                   radio=True)
                   for c, name in SOURCES.items()]
             )),
             pystray.MenuItem("开机自启动", self.toggle_autostart,
@@ -1297,12 +1375,19 @@ class GoldTray:
             pystray.MenuItem("退出", self.quit),
         )
 
+    def _source_action(self, code):
+        # pystray calls actions with (icon, item); capture code in a closure,
+        # never in a second positional default that the MenuItem overwrites.
+        def select(icon, item):
+            self.set_source(code)
+        return select
+
     def _price_str(self):
         if self.quote and "price" in self.quote:
             q = self.quote
             if q.get("cny"):
                 return (f"{q['price']:.2f} 元/克  {q['change']:+.2f} "
-                        f"({q['pct']:+.2f}%)")
+                        f"({q['pct']:+.2f}%)" + ("（更新失败）" if q.get("stale") else ""))
             unit = "美元/盎司" if q["code"].startswith("hf_") else "元/克"
             return f"{q['price']:.2f} {unit}  {q['change']:+.2f} ({q['pct']:+.2f}%)"
         if self.last_error:
@@ -1313,15 +1398,39 @@ class GoldTray:
         return get_autostart_status()
 
     def refresh_now(self, icon=None, item=None):
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        self._refresh_event.set()
 
     def set_source(self, code):
-        self.source = code
+        if not isinstance(code, str) or code not in SOURCES:
+            self._log("rejected invalid source selection")
+            return False
+        with self._state_lock:
+            if code != self.source:
+                self.source = code
+                self._source_generation += 1
+                self.quote = None
+                self.last_error = None
+                self._err_streak = 0
+                self._log_ts = 0.0
+                self._last_dir = None
+                self._last_title = f"{SOURCES[code]} 加载中…"
+                if self.icon:
+                    self.icon.icon = render_icon("…", COLOR_FLAT)
+                    self._sync_tray_title()
+        try:
+            save_source(code)
+        except Exception as exc:
+            self._log(f"settings save failed: {exc}")
+            self._toast("品种已切换，但保存设置失败")
         self.refresh_now()
+        return True
 
     def toggle_autostart(self, icon, item):
         enable = not get_autostart_status()
-        set_autostart(enable)
+        if not set_autostart(enable):
+            self._toast("修改开机自启动失败，请查看日志")
+            self._log("autostart update failed")
+            return
         self._toast("开机自启动已" + ("开启" if enable else "关闭"))
         icon.update_menu()
 
@@ -1336,13 +1445,22 @@ class GoldTray:
 
     def uninstall_self(self, icon, item):
         """托盘菜单卸载：先记下要删的东西，停止自身后交给延迟脚本收尾"""
-        self.running = False
-        self.hover.stop()
+        if TK_OK and self.hover.root is not None:
+            self.hover.commands.put("uninstall")
+        else:
+            self._toast("卸载确认界面尚未就绪，请稍后重试")
+
+    def _confirmed_uninstall(self):
         do_uninstall()
-        icon.stop()
+        self.running = False
+        self._refresh_event.set()
+        self.hover.stop()
+        if self.icon:
+            self.icon.stop()
 
     def quit(self, icon, item):
         self.running = False
+        self._refresh_event.set()
         self.hover.stop()
         icon.stop()
 
@@ -1354,23 +1472,31 @@ class GoldTray:
                 pass
 
     def open_chart(self, icon=None, item=None):
-        def _run():
-            try:
-                import chart
-                chart.run_chart(lambda: self.quote or fetch_quote(self.source))
-            except Exception as e:
-                self._log(f"chart error: {e}")
-        threading.Thread(target=_run, daemon=True).start()
+        if TK_OK and self.hover.root is not None:
+            self.hover.open_chart()
+        else:
+            self._toast("走势图界面尚未就绪，请稍后重试")
 
     def _refresh_worker(self):
-        try:
-            q = fetch_quote(self.source)
-        except Exception as e:
-            self._log(f"fetch exception: {e}")
-            q = None
+        # One request at a time; discard responses for superseded selections.
+        with self._fetch_lock:
+            with self._state_lock:
+                source = self.source
+                generation = self._source_generation
+            try:
+                q = fetch_quote(source)
+            except Exception as exc:
+                q = {"error": str(exc)}
+            with self._state_lock:
+                if not self.running or generation != self._source_generation:
+                    return
+                self._apply_quote(q)
+
+    def _apply_quote(self, q):
         if q is None or "error" in q:
             self.last_error = (q or {}).get("error", "未知错误")
-            self.quote = None
+            if self.quote:
+                self.quote = dict(self.quote, stale=True)
             # 只记一次失败的开头。原先这里完全不写日志 —— 最该留痕的断网反而
             # 没有任何记录；而每 30 秒刷一行的"成功"日志却写了满盘。
             if self._err_streak == 0:
@@ -1378,8 +1504,15 @@ class GoldTray:
             self._err_streak += 1
             if self.icon:
                 try:
-                    self.icon.icon = render_icon("--", COLOR_ERR)
-                    self._last_title = f"金价获取失败: {self.last_error}"
+                    if not self.quote:
+                        self.icon.icon = render_icon("--", COLOR_ERR)
+                        self._last_title = f"{SOURCES[self.source]} 金价获取失败: {self.last_error}"
+                    else:
+                        price = self.quote['price']
+                        txt = f"{price:.1f}" if price < 1000 else f"{price:.0f}"
+                        self.icon.icon = render_icon(txt, COLOR_ERR)
+                        self._last_title = (f"{SOURCES[self.source]} {self.quote['price']:.2f} 元/克\n"
+                                            f"更新失败，显示上次报价 {self.quote['date']} {self.quote['time']}")
                     self._sync_tray_title()
                 except Exception as e:
                     self._log(f"icon update failed: {e}")
@@ -1456,34 +1589,48 @@ class GoldTray:
 
     @classmethod
     def _log(cls, msg):
+        with cls._log_lock:
+            cls._write_log(msg)
+
+    @classmethod
+    def _write_log(cls, msg):
         try:
             path = cls._log_path()
-            # 大小轮转：超过上限只保留最后 LOG_KEEP_LINES 行。
-            # 节流之后正常一天才写约 25 行，这一步基本不会触发；
-            # 留着是为了让"磁盘占用有界"成为必然，而不是依赖节流不出错。
+            msg = str(msg).replace("\r", " ").replace("\n", " ")[:2000]
+            entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n".encode("utf-8")
+            # Limit bytes as well as line count, including oversized error lines.
             try:
-                if os.path.getsize(path) > LOG_MAX_BYTES:
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        keep = f.readlines()[-LOG_KEEP_LINES:]
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.writelines(keep)
+                size = os.path.getsize(path)
+                if size + len(entry) > LOG_MAX_BYTES:
+                    budget = min(LOG_MAX_BYTES // 2, LOG_MAX_BYTES - len(entry))
+                    with open(path, "rb") as f:
+                        start = max(0, size - budget)
+                        f.seek(start)
+                        keep = f.read().splitlines(keepends=True)
+                    if start and keep:
+                        keep = keep[1:]
+                    with open(path, "wb") as f:
+                        f.write(b"".join(keep[-LOG_KEEP_LINES:]))
             except OSError:
                 pass
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+            with open(path, "ab") as f:
+                f.write(entry)
         except Exception:
             pass
 
     def _loop(self):
         while self.running:
-            self._refresh_worker()
-            for _ in range(REFRESH_INTERVAL):
-                if not self.running:
-                    return
-                time.sleep(1)
+            self._refresh_event.wait(REFRESH_INTERVAL)
+            self._refresh_event.clear()
+            if not self.running:
+                return
+            try:
+                self._refresh_worker()
+            except Exception as exc:
+                self._log(f"refresh worker error: {exc}")
 
     def _make_icon(self):
-        return pystray.Icon("GoldPriceTray",
+        return PriceIcon("GoldPriceTray",
                             render_icon("…", COLOR_FLAT),
                             "金价小工具…", self.menu())
 
@@ -1494,7 +1641,7 @@ class GoldTray:
         就弹卡）。因此这一步的结论直接决定悬浮卡是否可用 —— 写进日志便于排查。"""
         time.sleep(5)
         try:
-            r = _tray_icon_hwnd()
+            r = _tray_icon_hwnd(self.icon)
         except Exception:
             r = None
         if r:
@@ -1506,21 +1653,37 @@ class GoldTray:
     def run(self):
         """主入口：pystray 消息循环偶发静默退出（GetMessage 返回 0/-1），
         这里包一层自动重启，保证托盘图标始终存活。刷新线程只启动一次。"""
+        self._log(f"startup v{APP_VERSION} [{self.source}]")
         self.hover.start()
         threading.Thread(target=self._loop, daemon=True).start()
         threading.Thread(target=self._selfcheck, daemon=True).start()
         while self.running:
             self.icon = self._make_icon()
             try:
-                self.icon.run()
+                self.icon.run(lambda icon: self._icon_ready(icon))
             except Exception as e:
                 self._log(f"icon loop error: {e}")
             if not self.running:
                 break
             self._log("icon loop exited unexpectedly, restarting in 3s…")
             time.sleep(3)
+        if self.hover._thread:
+            self.hover._thread.join(timeout=2)
+
+    def _icon_ready(self, icon):
+        with self._state_lock:
+            icon.visible = True
+            if self.quote:
+                error = self.last_error
+                self._apply_quote(dict(self.quote))
+                if error:
+                    self._apply_quote({"error": error})
+            else:
+                self._last_title = f"{SOURCES[self.source]} 加载中…"
+                self._sync_tray_title()
 
 if __name__ == "__main__":
+    enable_dpi_awareness()
     if _frozen():
         # 单文件版分派：/uninstall 卸载 · /silent 静默安装 · 不在安装目录 → 安装向导
         arg = (sys.argv[1].lower() if len(sys.argv) > 1 else "")
@@ -1534,4 +1697,5 @@ if __name__ == "__main__":
             GoldTray().run()
         # 检测到已有托盘实例时静默退出，避免双图标
     else:
-        GoldTray().run()
+        if _single_instance_ok():
+            GoldTray().run()

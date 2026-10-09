@@ -26,6 +26,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build single-file exe
         run: pyinstaller --noconfirm GoldPriceTray.spec
 

@@ -3,12 +3,14 @@
 chart.py —— 金价走势图窗口（tkinter）
 """
 import json
+import math
 import re
 import time
 import threading
 import queue
 import urllib.request
 import tkinter as tk
+from quote_http import open_quote
 
 # Tk 用字体族名（而非字体文件路径）；跨机器可移植，找不到时 Tk 自动回退默认字体
 FONT_BOLD = "Microsoft YaHei UI"
@@ -23,7 +25,7 @@ def fetch_usdcny():
     url = "https://hq.sinajs.cn/list=fx_susdcny"
     req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with open_quote(req, timeout=8) as r:
             raw = r.read().decode("gbk", errors="ignore")
         m = re.search(r'"([^"]*)"', raw)
         if not m or not m.group(1).strip():
@@ -51,22 +53,33 @@ def _get_cny_rate():
 
 def fetch_daily_kline(symbol=KLINE_SYMBOL, count=30):
     """新浪全球期货日K线（伦敦金等外盘），返回 [(date, close)] 最近 count 条；
-    自动按实时汇率换算为人民币元/克；汇率失败则原样返回美元价；失败返回 []"""
+    自动按实时汇率换算为人民币元/克；行情或汇率失败返回 []"""
     url = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
            f"var%20t=/GlobalFuturesService.getGlobalFuturesDailyKLine?symbol={symbol}")
     try:
         req = urllib.request.Request(url, headers={
             "Referer": "https://finance.sina.com.cn",
             "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with open_quote(req, timeout=10) as r:
             txt = r.read().decode("utf-8", errors="ignore")
         m = re.search(r"\((\[.*\])\)", txt)
         if not m:
             return []
         data = json.loads(m.group(1))
         rate = _get_cny_rate()
-        k = (rate / OZ_TO_GRAM) if rate else 1.0
-        out = [(d["date"], float(d["close"]) * k) for d in data[-count:]]
+        if not rate:
+            return []
+        k = rate / OZ_TO_GRAM
+        out = []
+        for d in data:
+            try:
+                close = float(d["close"])
+                if math.isfinite(close) and close > 0:
+                    out.append((str(d["date"]), close * k))
+            except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda row: row[0])
+        out = out[-count:]
         return out
     except Exception:
         return []
@@ -81,7 +94,7 @@ def fetch_minute_kline(symbol=KLINE_SYMBOL, mtype=5):
         req = urllib.request.Request(url, headers={
             "Referer": "https://finance.sina.com.cn",
             "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with open_quote(req, timeout=10) as r:
             txt = r.read().decode("utf-8", errors="ignore")
         m = re.search(r"\((\{.*\})\)", txt)
         if not m:
@@ -89,15 +102,19 @@ def fetch_minute_kline(symbol=KLINE_SYMBOL, mtype=5):
         obj = json.loads(m.group(1))
         arr = obj.get("minLine_1d", [])
         rate = _get_cny_rate()
-        k = (rate / OZ_TO_GRAM) if rate else 1.0
+        if not rate:
+            return []
+        k = rate / OZ_TO_GRAM
         out = []
         for e in arr:
             if len(e) >= 2 and e[1]:
                 # 每条的最后元素是完整时间戳 "2026-09-01 06:01:00"（第一条为 10 字段，后续 6 字段）
-                ts = e[-1] if len(e[-1]) >= 10 else e[0]
+                ts = e[-1] if isinstance(e[-1], str) and len(e[-1]) >= 10 else str(e[0])
                 try:
-                    out.append((ts, float(e[1]) * k))
-                except ValueError:
+                    price = float(e[1])
+                    if math.isfinite(price) and price > 0:
+                        out.append((ts, price * k))
+                except (TypeError, ValueError):
                     continue
         return out
     except Exception:
@@ -115,7 +132,7 @@ def fetch_spot_quote():
     url = "https://hq.sinajs.cn/list=hf_XAU"
     req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with open_quote(req, timeout=8) as r:
             raw = r.read().decode("gbk", errors="ignore")
         m = re.search(r'"([^"]*)"', raw)
         if not m or not m.group(1).strip():
@@ -127,8 +144,11 @@ def fetch_spot_quote():
         if not rate:
             return None
         k = rate / OZ_TO_GRAM
+        price, prev = float(f[0]), float(f[7])
+        if not all(math.isfinite(v) and v > 0 for v in (price, prev)):
+            return None
         return {"code": "hf_XAU", "name": "伦敦金",
-                "price": float(f[0]) * k, "prev": float(f[7]) * k,
+                "price": price * k, "prev": prev * k,
                 "unit": "元/克", "date": f[12], "time": f[6]}
     except Exception:
         return None
@@ -136,16 +156,17 @@ def fetch_spot_quote():
 
 def fetch_kline_quote(main_quote):
     """让基准价与 k 线序列同源：主品种不是国际盘时，改用伦敦金自己的报价。"""
-    if main_quote and str(main_quote.get("code", "")).startswith("hf_"):
+    if (main_quote and main_quote.get("code") == "hf_XAU"
+            and main_quote.get("cny") and not main_quote.get("stale")):
         return main_quote
-    return fetch_spot_quote() or main_quote
+    return fetch_spot_quote()
 
 
 class ChartWindow:
     W, H = 760, 460
     PAD_L, PAD_R, PAD_T, PAD_B = 62, 20, 46, 36
 
-    def __init__(self, get_quote):
+    def __init__(self, get_quote, master=None):
         self.get_quote = get_quote
         self.mode = "day"
         self.data = []
@@ -155,14 +176,22 @@ class ChartWindow:
         self.data_time = ""
         self.unit = "元/克"
         self.q = queue.Queue()
-        self.root = tk.Tk()
+        self._request_id = 0
+        self._closed = False
+        self._poll_id = None
+        self.root = tk.Toplevel(master) if master is not None else tk.Tk()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        scale = max(1.0, self.root.winfo_fpixels('1i') / 96.0)
+        self.PAD_L, self.PAD_R, self.PAD_T, self.PAD_B = (
+            round(value * scale) for value in (62, 20, 46, 36))
         self.root.title("金价走势 · GoldPriceTray")
-        self.root.geometry(f"{self.W}x{self.H}")
+        self.root.geometry(f"{round(self.W * scale)}x{round(self.H * scale)}")
+        self.root.minsize(round(600 * scale), round(360 * scale))
         self.root.configure(bg="#1e1f22")
         self.root.resizable(True, True)
         self._build()
         self.load_data()
-        self.root.after(80, self._poll)
+        self._poll_id = self.root.after(80, self._poll)
 
     def _build(self):
         top = tk.Frame(self.root, bg="#1e1f22")
@@ -211,97 +240,105 @@ class ChartWindow:
         self.load_data()
 
     def load_data(self):
+        self._request_id += 1
+        request_id, mode = self._request_id, self.mode
         self.title_line = "加载中…"
         self.data = []
         self.prev_line = None
         self.lbl_price.configure(text="")
-        threading.Thread(target=self._fetch_worker, daemon=True).start()
+        self._redraw()
+        threading.Thread(target=self._fetch_worker, args=(request_id, mode), daemon=True).start()
 
-    def _fetch_worker(self):
+    def _fetch_worker(self, request_id, mode):
         try:
-            if self.mode == "day":
-                self._fetch_day()
-            elif self.mode == "week":
-                self._fetch_daily(5)
+            if mode == "day":
+                result = self._fetch_day()
+            elif mode == "week":
+                result = self._fetch_daily(5)
             else:
-                self._fetch_daily(22)
+                result = self._fetch_daily(22)
         except Exception as e:
-            self.q.put(("error", str(e)))
+            result = {"error": str(e)}
+        self.q.put((request_id, result))
 
     def _fetch_day(self):
         q = fetch_kline_quote(self.get_quote())
         rows = fetch_minute_kline(KLINE_SYMBOL, 5)
+        if not rows:
+            return {"error": "无法获取分时数据或人民币汇率"}
         today = time.strftime("%Y-%m-%d")
         # 国际金价 24h 连续交易（北京时间 06:00 起），保留当日全部数据
-        rows = [(t, p) for t, p in rows if t.startswith(today)]
-        if not rows:
-            rows = fetch_minute_kline(KLINE_SYMBOL, 5)[-24:]
-        if not rows:
-            self.q.put(("error", "无法获取当日分时数据"))
-            return
+        current_rows = [(t, p) for t, p in rows if t.startswith(today)]
+        data_date = today if current_rows else rows[-1][0][:10]
+        rows = current_rows or [(t, p) for t, p in rows if t.startswith(data_date)]
         labels = [t[11:16] for t, _ in rows]
         prev = q.get("prev") if q and "prev" in q else None
-        name = q.get("name") if q else "沪金99"
+        name = "伦敦金参考行情"
         cur = q.get("price") if q and "price" in q else rows[-1][1]
-        unit = q.get("unit", "美元/盎司") if q else "美元/盎司"
-        tstr = (f"{q.get('date', '')} {q.get('time', '')}"
-                if q and q.get("time") else time.strftime("%Y-%m-%d %H:%M:%S"))
+        unit = "元/克"
+        tstr = rows[-1][0]
+        # An old trading session must not use today's spot quote as its endpoint.
+        if not q or q.get("date") != data_date:
+            q, cur, prev = None, rows[-1][1], None
         if prev:
             chg = cur - prev
             pct = chg / prev * 100
-            self.title_line = f"{name} 当日分时"
-            self.prev_line = (prev, f"昨收 {prev:.2f}")
+            prev_line = (prev, f"昨收 {prev:.2f}")
         else:
             chg = pct = 0
-            self.title_line = f"{name} 当日分时"
-        self.q.put(("day", labels, [p for _, p in rows], cur, chg, pct, name, tstr, unit))
+            prev_line = None
+        title = f"{name} 当日分时" if data_date == today else f"{name} 最近交易日 {data_date}"
+        return dict(data=list(zip(labels, [p for _, p in rows])), latest=(cur, chg, pct, name),
+                    title=title, prev_line=prev_line, data_time=tstr, unit=unit)
 
     def _fetch_daily(self, n):
         rows = fetch_daily_kline(KLINE_SYMBOL, n)
         if not rows:
-            self.q.put(("error", "无法获取日K数据"))
-            return
+            return {"error": "无法获取日K数据或人民币汇率"}
         dates = [d for d, _ in rows]
         closes = [c for _, c in rows]
-        q = fetch_kline_quote(self.get_quote())
-        name = q.get("name") if q else "沪金99"
+        name = "伦敦金参考行情"
         cur = closes[-1]
         prev = closes[-2] if len(closes) > 1 else cur
         chg, pct = cur - prev, (cur - prev) / prev * 100 if prev else 0
-        unit = q.get("unit", "美元/盎司") if q else "美元/盎司"
-        tstr = (f"{q.get('date', '')} {q.get('time', '')}"
-                if q and q.get("time") else time.strftime("%Y-%m-%d %H:%M:%S"))
+        unit = "元/克"
+        tstr = dates[-1]
         span = "近一周" if n <= 5 else "近一月"
-        self.title_line = f"{name} {span}"
-        self.prev_line = (prev, f"昨收 {prev:.2f}")
-        self.q.put(("daily", dates, closes, cur, chg, pct, name, tstr, unit))
+        return dict(data=list(zip([d[5:] for d in dates], closes)), latest=(cur, chg, pct, name),
+                    title=f"{name} {span}", prev_line=(prev, f"前一交易日 {prev:.2f}"),
+                    data_time=tstr, unit=unit)
 
     def _poll(self):
+        if self._closed:
+            return
         try:
             while True:
-                item = self.q.get_nowait()
-                if item[0] == "error":
-                    self.title_line = f"数据获取失败: {item[1]}"
+                request_id, result = self.q.get_nowait()
+                if request_id != self._request_id:
+                    continue
+                if "error" in result:
+                    self.title_line = f"数据获取失败: {result['error']}"
                     self.data = []
-                    self._redraw()
-                elif item[0] == "day":
-                    _, labels, prices, cur, chg, pct, name, tstr, unit = item
-                    self.data = list(zip(labels, prices))
-                    self.latest = (cur, chg, pct, name)
-                    self.data_time = tstr
-                    self.unit = unit
-                    self._redraw()
-                elif item[0] == "daily":
-                    _, dates, closes, cur, chg, pct, name, tstr, unit = item
-                    labels = [d[5:] for d in dates]
-                    self.data = list(zip(labels, closes))
-                    self.latest = (cur, chg, pct, name)
-                    self.data_time = tstr
-                    self.unit = unit
-                    self._redraw()
+                    self.prev_line = None
+                    self.data_time = ""
+                else:
+                    self.title_line = result["title"]
+                    self.data = result["data"]
+                    self.latest = result["latest"]
+                    self.prev_line = result["prev_line"]
+                    self.data_time = result["data_time"]
+                    self.unit = result["unit"]
+                self._redraw()
         except queue.Empty:
             pass
-        self.root.after(80, self._poll)
+        self._poll_id = self.root.after(80, self._poll)
+
+    def close(self):
+        self._closed = True
+        self._request_id += 1
+        if self._poll_id is not None:
+            self.root.after_cancel(self._poll_id)
+        self.root.destroy()
 
     def _redraw(self):
         if self.data:
@@ -317,10 +354,11 @@ class ChartWindow:
                 text=f"{cur:.2f}   {chg:+.2f} ({pct:+.2f}%)", fg=c)
             self.lbl_title.configure(text=self.title_line)
             self.lbl_status.configure(
-                text=f"数据时间 {self.data_time}" if self.data_time else "")
+                text=f"伦敦金参考行情 · 元/克 · 数据时间 {self.data_time}")
         else:
             self.lbl_title.configure(text=self.title_line)
             self.lbl_price.configure(text="")
+            self.lbl_status.configure(text="伦敦金参考行情 · 元/克")
         self.draw()
 
     def draw(self):
